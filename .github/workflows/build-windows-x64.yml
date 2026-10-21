@@ -88,27 +88,49 @@ jobs:
 
       - name: Extract third-party sources
         # Only the headers are needed: the static libraries are already in the repo.
+        # cmake -E tar is used instead of the bare "tar" of Windows, which is what
+        # the project's own Setup.ps1 relies on.
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $dev = $env:DEV_DIR
           $sources = Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\Sources'
+          Write-Host "DEV_DIR = $dev"
+          Write-Host "sources = $sources"
           New-Item -ItemType Directory -Force -Path "$dev\Qt\$env:QT_VERSION" | Out-Null
           foreach ($name in 'FFmpeg', 'Libzip', 'OpenAL') {
             New-Item -ItemType Directory -Force -Path "$dev\$name" | Out-Null
           }
-          Push-Location "$dev\FFmpeg"; tar -xf "$sources\ffmpeg-5.1.10.tar.xz"; Pop-Location
-          if ($LASTEXITCODE -ne 0) { throw 'Extracting the FFmpeg sources failed' }
-          Push-Location "$dev\Libzip"; tar -xf "$sources\libzip-1.11.4.tar.gz"; Pop-Location
-          if ($LASTEXITCODE -ne 0) { throw 'Extracting the libzip sources failed' }
-          Push-Location "$dev\OpenAL"; tar -xf "$sources\openal-soft-1.24.3.tar.bz2"; Pop-Location
-          if ($LASTEXITCODE -ne 0) { throw 'Extracting the OpenAL sources failed' }
+          Write-Host 'created the target directories'
+          foreach ($archive in 'ffmpeg-5.1.10.tar.xz', 'libzip-1.11.4.tar.gz', 'openal-soft-1.24.3.tar.bz2') {
+            $target = if ($archive -like 'ffmpeg*') { 'FFmpeg' } elseif ($archive -like 'libzip*') { 'Libzip' } else { 'OpenAL' }
+            Write-Host "extracting $archive into $target"
+            Push-Location "$dev\$target"
+            try {
+              cmake -E tar xf "$sources\$archive"
+            }
+            finally { Pop-Location }
+            if ($LASTEXITCODE -ne 0) { throw "Extracting $archive failed" }
+            Write-Host "extracted $archive"
+          }
           foreach ($expected in "$dev\FFmpeg\ffmpeg-5.1.10", "$dev\Libzip\libzip-1.11.4", "$dev\OpenAL\openal-soft-1.24.3") {
             if (-not (Test-Path -LiteralPath $expected)) { throw "Missing source directory: $expected" }
           }
+          Write-Host 'all source directories are in place'
           # jom: parallel nmake, used to build Qt
-          Expand-Archive -Path (Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\jom_1_1_7.zip') `
-            -DestinationPath "$dev\Jom" -Force
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (Test-Path -LiteralPath $sevenZip) {
+            Write-Host 'extracting jom with 7-Zip'
+            & $sevenZip x -y "-o$dev\Jom" "$sources\jom_1_1_7.zip"
+            if ($LASTEXITCODE -ne 0) { throw 'Extracting jom failed' }
+          }
+          else {
+            Write-Host 'extracting jom with Expand-Archive'
+            Expand-Archive -Path (Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\jom_1_1_7.zip') `
+              -DestinationPath "$dev\Jom" -Force
+          }
+          if (-not (Test-Path -LiteralPath "$dev\Jom\jom.exe")) { throw 'jom.exe was not extracted' }
+          Write-Host 'jom is in place'
           Get-ChildItem -LiteralPath $dev | Select-Object -ExpandProperty Name
 
       - name: Clone Qt sources
@@ -116,10 +138,207 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $qtSource = "$env:DEV_DIR\Qt\$env:QT_VERSION\qt5"
+          Write-Host "cloning Qt into $qtSource"
           if (-not (Test-Path -LiteralPath "$qtSource\qtbase")) {
             git clone --branch $env:QT_REF --depth 1 https://code.qt.io/qt/qt5.git $qtSource
             if ($LASTEXITCODE -ne 0) { throw 'Qt clone failed' }
             Push-Location $qtSource
             try {
               # Only QtBase is needed (Core, Gui, Widgets, Network, PrintSupport).
-              perl init-repository --module-subset
+              perl init-repository --module-subset=qtbase
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host 'init-repository failed, cloning qtbase directly'
+                Pop-Location
+                git clone --branch $env:QT_REF --depth 1 https://code.qt.io/qt/qtbase.git "$qtSource\qtbase"
+                if ($LASTEXITCODE -ne 0) { throw 'QtBase clone failed' }
+                Push-Location $qtSource
+              }
+            }
+            finally { Pop-Location }
+            if (-not (Test-Path -LiteralPath "$qtSource\qtbase")) { throw 'QtBase sources are missing' }
+            Write-Host 'Qt sources are in place'
+          }
+
+      - name: Restore cached Qt installation
+        id: qt-cache
+        uses: actions/cache@v4
+        with:
+          path: C:/Dev/Qt/5.15.19/install
+          key: qt-win32-x64-5.15.19-static-v2
+
+      - name: Build Qt 5.15.19 (static)
+        if: steps.qt-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qtRoot = "$env:DEV_DIR\Qt\$env:QT_VERSION"
+          $qtBuild = "$qtRoot\build"
+          $qtInstall = "$qtRoot\install"
+          New-Item -ItemType Directory -Force -Path $qtBuild | Out-Null
+          Push-Location $qtBuild
+          try {
+            Write-Host 'configuring Qt'
+            & "$qtRoot\qt5\configure.bat" `
+              -platform win32-msvc `
+              -opensource -confirm-license `
+              -release -static -static-runtime `
+              -opengl desktop `
+              -qt-libpng -qt-libjpeg -qt-zlib -qt-harfbuzz -qt-pcre -qt-doubleconversion `
+              -no-feature-textmarkdownreader -no-feature-textmarkdownwriter `
+              -no-feature-bearermanagement -no-libinput -no-libmd4c -no-icu `
+              -no-sql -no-xml -no-testlib -no-dbus -no-concurrent `
+              -nomake tests -nomake examples -nomake tools `
+              -prefix $qtInstall
+            if ($LASTEXITCODE -ne 0) { throw 'Qt configuration failed' }
+
+            Write-Host 'building Qt with jom (this takes 1-3 hours)'
+            & "$env:DEV_DIR\Jom\jom.exe" -j $env:BUILD_JOBS
+            if ($LASTEXITCODE -ne 0) { throw 'Qt build failed' }
+            Write-Host 'installing Qt'
+            & "$env:DEV_DIR\Jom\jom.exe" install
+            if ($LASTEXITCODE -ne 0) { throw 'Qt installation failed' }
+          }
+          finally { Pop-Location }
+
+      - name: Verify Qt installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qtInstall = "$env:DEV_DIR\Qt\$env:QT_VERSION\install"
+          if (-not (Test-Path -LiteralPath "$qtInstall\lib\cmake\Qt5\Qt5Config.cmake")) {
+            throw "Qt was not installed in $qtInstall"
+          }
+          # Free disk space for the app build.
+          if (Test-Path -LiteralPath "$env:DEV_DIR\Qt\$env:QT_VERSION\build") {
+            Remove-Item -LiteralPath "$env:DEV_DIR\Qt\$env:QT_VERSION\build" -Recurse -Force
+          }
+          Get-ChildItem -LiteralPath $qtInstall | Select-Object -ExpandProperty Name
+
+      - name: Build Mine-imator (Release, x64)
+        # Same as ".\Setup.ps1 Release": configure with the Visual Studio generator,
+        # build the Release configuration, then install into install/Mine-imator.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_WORKSPACE
+          $build = Join-Path $repo 'build-release'
+          # When a GML change makes CppGen produce one generated file more or fewer,
+          # the first build still uses the old file list and fails; the second one has
+          # a refreshed list.
+          for ($attempt = 1; $attempt -le 2; $attempt++) {
+            Write-Host 'configuring the app with CMake'
+          cmake -S "$repo\CppProject" -B $build -G "Visual Studio 17 2022" -A x64
+            if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+            cmake --build $build --parallel $env:BUILD_JOBS --config Release
+            if ($LASTEXITCODE -ne 0) {
+              if ($attempt -eq 1) {
+                Write-Host 'Build failed, retrying once with the refreshed file list'
+                continue
+              }
+              throw 'Release build failed'
+            }
+            break
+          }
+          cmake --install $build --config Release
+          if ($LASTEXITCODE -ne 0) { throw 'Install failed' }
+          Get-ChildItem -LiteralPath (Join-Path $repo 'install\Mine-imator') | Select-Object -ExpandProperty Name
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run MCP server unit tests
+        # Verifies the fork's own code, not the build. Never blocks the release.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Set-Location (Join-Path $env:GITHUB_WORKSPACE 'mcp')
+          npm ci
+          npm test
+
+      - name: Verify the built executable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $install = Join-Path $env:GITHUB_WORKSPACE 'install\Mine-imator'
+          $exe = Join-Path $install 'Mine-imator.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'Mine-imator.exe was not installed' }
+          foreach ($expected in 'vcomp140.dll', 'Data', 'Particles', 'Schematics') {
+            if (-not (Test-Path -LiteralPath (Join-Path $install $expected))) {
+              throw "The install is missing $expected"
+            }
+          }
+          # Read the PE machine type: 0x8664 is AMD64, 0x014c is x86.
+          $stream = [System.IO.File]::OpenRead($exe)
+          try {
+            $reader = New-Object System.IO.BinaryReader($stream)
+            $stream.Seek(0x3C, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $peOffset = $reader.ReadInt32()
+            $stream.Seek($peOffset + 4, [System.IO.SeekOrigin]::Begin) | Out-Null
+            $machine = $reader.ReadUInt16()
+          }
+          finally { $stream.Dispose() }
+          if ($machine -ne 0x8664) {
+            throw ('Mine-imator.exe is not a 64-bit binary (PE machine 0x{0:X4})' -f $machine)
+          }
+          Write-Host "Mine-imator.exe is a 64-bit binary ($([math]::Round((Get-Item $exe).Length / 1MB, 1)) MB)"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_WORKSPACE
+          $install = Join-Path $repo 'install\Mine-imator'
+          if (-not (Test-Path -LiteralPath (Join-Path $install 'Mine-imator.exe'))) {
+            throw 'Mine-imator.exe was not built'
+          }
+          $stage = Join-Path $env:RUNNER_TEMP 'package'
+          if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -LiteralPath $install -Destination $stage -Recurse
+          $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+          if (Test-Path -LiteralPath $sevenZip) {
+            & $sevenZip a -tzip -mx=9 'Mine-imator-win-x64.zip' "$stage\Mine-imator"
+            if ($LASTEXITCODE -ne 0) { throw 'Packaging failed' }
+          }
+          else {
+            Compress-Archive -Path "$stage\Mine-imator" -DestinationPath 'Mine-imator-win-x64.zip'
+          }
+          $hash = (Get-FileHash 'Mine-imator-win-x64.zip' -Algorithm SHA256).Hash
+          "$hash  Mine-imator-win-x64.zip" | Out-File -FilePath 'Mine-imator-win-x64.zip.sha256' -Encoding ascii
+          Get-Item 'Mine-imator-win-x64.zip' | Select-Object Name, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mine-imator-win-x64
+          path: |
+            Mine-imator-win-x64.zip
+            Mine-imator-win-x64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish to GitHub release
+        if: ${{ github.event_name == 'push' || inputs.publish }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:RELEASE_TAG
+          if (-not $tag) { $tag = $env:REF_NAME }
+          if (-not $tag) { $tag = "build-$env:RUN_NUMBER" }
+          $notes = "Automated Windows x64 build of commit $($env:SHA) ($($env:REF_NAME))."
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $env:GITHUB_REPOSITORY --title "Mine-imator $tag" --notes $notes
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the release $tag" }
+          }
+          gh release upload $tag 'Mine-imator-win-x64.zip' 'Mine-imator-win-x64.zip.sha256' --clobber --repo $env:GITHUB_REPOSITORY
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload the assets to $tag" }
+          Write-Host "Published to https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$tag"
