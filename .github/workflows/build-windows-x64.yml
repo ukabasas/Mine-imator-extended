@@ -1,0 +1,125 @@
+# Builds Mine-imator for Windows x64 (Windows 10 / 11, 64-bit) and publishes it
+# to a GitHub release.
+#
+# What the job does
+#   1. Builds Qt 5.15.19 from source: static, win32-msvc, static CRT (/MT).
+#      The app links Qt statically, so there is no official binary to download.
+#   2. Extracts the FFmpeg / libzip / OpenAL headers from the source archives that
+#      are committed under CppProject/External/Sources. The matching static
+#      libraries are already committed under CppProject/External/Win64, so no other
+#      dependency has to be compiled.
+#   3. Configures and builds CppProject with CMake + MSVC (Release, x64) and installs
+#      it into install/Mine-imator. This is the same thing ".\Setup.ps1 Release" does.
+#   4. Zips the install folder and uploads it to a GitHub release.
+#
+# The Qt build takes roughly 1-3 hours on a GitHub runner. The Qt installation is
+# cached, so later runs only rebuild the app (a few minutes).
+#
+# The Qt modules that the app does not use (SQL, XML, Test, DBus, Concurrent) are
+# switched off, which cuts a noticeable slice off the Qt build. The app includes no
+# header from any of them, and qtbase's own src.pro builds each of those modules
+# only when its feature is enabled.
+#
+# Trigger it from the Actions tab ("Run workflow"), or push a v* tag.
+
+name: Build Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish to (empty = build-<run number>)'
+        required: false
+        default: ''
+      publish:
+        description: 'Publish the build to a GitHub release'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Where the third-party libraries are installed. Keep it short: Qt's build
+  # scripts can hit the Windows path length limit.
+  DEV_DIR: C:\Dev
+  QT_VERSION: '5.15.19'
+  QT_REF: 'v5.15.19-lts-lgpl'
+  # Parallel compile jobs. The runner has 4 cores, 8 keeps the CPU busy.
+  BUILD_JOBS: 8
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2022
+    # The Qt build is the long pole. GitHub allows up to 360 minutes per job.
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64 native tools)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Strawberry Perl
+        # Qt's configure script and init-repository are perl scripts.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $perl = 'C:\Strawberry\perl\bin\perl.exe'
+          if (-not (Test-Path -LiteralPath $perl)) {
+            choco install strawberryperl -y --no-progress
+          }
+          if (-not (Test-Path -LiteralPath $perl)) {
+            throw 'Strawberry Perl was not installed'
+          }
+          'C:\Strawberry\perl\bin;C:\Strawberry\c\bin' | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          perl -v
+
+      - name: Extract third-party sources
+        # Only the headers are needed: the static libraries are already in the repo.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dev = $env:DEV_DIR
+          $sources = Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\Sources'
+          New-Item -ItemType Directory -Force -Path "$dev\Qt\$env:QT_VERSION" | Out-Null
+          foreach ($name in 'FFmpeg', 'Libzip', 'OpenAL') {
+            New-Item -ItemType Directory -Force -Path "$dev\$name" | Out-Null
+          }
+          Push-Location "$dev\FFmpeg"; tar -xf "$sources\ffmpeg-5.1.10.tar.xz"; Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw 'Extracting the FFmpeg sources failed' }
+          Push-Location "$dev\Libzip"; tar -xf "$sources\libzip-1.11.4.tar.gz"; Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw 'Extracting the libzip sources failed' }
+          Push-Location "$dev\OpenAL"; tar -xf "$sources\openal-soft-1.24.3.tar.bz2"; Pop-Location
+          if ($LASTEXITCODE -ne 0) { throw 'Extracting the OpenAL sources failed' }
+          foreach ($expected in "$dev\FFmpeg\ffmpeg-5.1.10", "$dev\Libzip\libzip-1.11.4", "$dev\OpenAL\openal-soft-1.24.3") {
+            if (-not (Test-Path -LiteralPath $expected)) { throw "Missing source directory: $expected" }
+          }
+          # jom: parallel nmake, used to build Qt
+          Expand-Archive -Path (Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\jom_1_1_7.zip') `
+            -DestinationPath "$dev\Jom" -Force
+          Get-ChildItem -LiteralPath $dev | Select-Object -ExpandProperty Name
+
+      - name: Clone Qt sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $qtSource = "$env:DEV_DIR\Qt\$env:QT_VERSION\qt5"
+          if (-not (Test-Path -LiteralPath "$qtSource\qtbase")) {
+            git clone --branch $env:QT_REF --depth 1 https://code.qt.io/qt/qt5.git $qtSource
+            if ($LASTEXITCODE -ne 0) { throw 'Qt clone failed' }
+            Push-Location $qtSource
+            try {
+              # Only QtBase is needed (Core, Gui, Widgets, Network, PrintSupport).
+              perl init-repository --module-subset
