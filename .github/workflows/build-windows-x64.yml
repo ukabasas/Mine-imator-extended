@@ -15,11 +15,6 @@
 # The Qt build takes roughly 1-3 hours on a GitHub runner. The Qt installation is
 # cached, so later runs only rebuild the app (a few minutes).
 #
-# The Qt modules that the app does not use (SQL, XML, Test, DBus, Concurrent) are
-# switched off, which cuts a noticeable slice off the Qt build. The app includes no
-# header from any of them, and qtbase's own src.pro builds each of those modules
-# only when its feature is enabled.
-#
 # Trigger it from the Actions tab ("Run workflow"), or push a v* tag.
 
 name: Build Windows x64
@@ -194,7 +189,6 @@ jobs:
               -qt-libpng -qt-libjpeg -qt-zlib -qt-harfbuzz -qt-pcre -qt-doubleconversion `
               -no-feature-textmarkdownreader -no-feature-textmarkdownwriter `
               -no-feature-bearermanagement -no-libinput -no-libmd4c -no-icu `
-              -no-sql -no-xml -no-testlib -no-dbus -no-concurrent `
               -nomake tests -nomake examples -nomake tools `
               -prefix $qtInstall
             if ($LASTEXITCODE -ne 0) { throw 'Qt configuration failed' }
