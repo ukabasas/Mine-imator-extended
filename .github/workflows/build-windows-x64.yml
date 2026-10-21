@@ -118,16 +118,18 @@ jobs:
           }
           Write-Host 'all source directories are in place'
           # jom: parallel nmake, used to build Qt
+          # The jom archive sits in CppProject/External, not in External/Sources.
+          $jomArchive = Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\jom_1_1_7.zip'
+          if (-not (Test-Path -LiteralPath $jomArchive)) { throw "jom archive not found at $jomArchive" }
           $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
           if (Test-Path -LiteralPath $sevenZip) {
             Write-Host 'extracting jom with 7-Zip'
-            & $sevenZip x -y "-o$dev\Jom" "$sources\jom_1_1_7.zip"
+            & $sevenZip x -y "-o$dev\Jom" $jomArchive
             if ($LASTEXITCODE -ne 0) { throw 'Extracting jom failed' }
           }
           else {
             Write-Host 'extracting jom with Expand-Archive'
-            Expand-Archive -Path (Join-Path $env:GITHUB_WORKSPACE 'CppProject\External\jom_1_1_7.zip') `
-              -DestinationPath "$dev\Jom" -Force
+            Expand-Archive -Path $jomArchive -DestinationPath "$dev\Jom" -Force
           }
           if (-not (Test-Path -LiteralPath "$dev\Jom\jom.exe")) { throw 'jom.exe was not extracted' }
           Write-Host 'jom is in place'
@@ -140,8 +142,14 @@ jobs:
           $qtSource = "$env:DEV_DIR\Qt\$env:QT_VERSION\qt5"
           Write-Host "cloning Qt into $qtSource"
           if (-not (Test-Path -LiteralPath "$qtSource\qtbase")) {
-            git clone --branch $env:QT_REF --depth 1 https://code.qt.io/qt/qt5.git $qtSource
-            if ($LASTEXITCODE -ne 0) { throw 'Qt clone failed' }
+            $cloned = $false
+            for ($attempt = 1; $attempt -le 2 -and -not $cloned; $attempt++) {
+              Write-Host "cloning Qt (attempt $attempt)"
+              git clone --branch $env:QT_REF --depth 1 https://code.qt.io/qt/qt5.git $qtSource
+              if ($LASTEXITCODE -eq 0) { $cloned = $true }
+              elseif ($attempt -eq 2) { throw 'Qt clone failed' }
+              else { Remove-Item -LiteralPath $qtSource -Recurse -Force -ErrorAction SilentlyContinue }
+            }
             Push-Location $qtSource
             try {
               # Only QtBase is needed (Core, Gui, Widgets, Network, PrintSupport).
@@ -161,7 +169,7 @@ jobs:
 
       - name: Restore cached Qt installation
         id: qt-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: C:/Dev/Qt/5.15.19/install
           key: qt-win32-x64-5.15.19-static-v2
@@ -201,6 +209,7 @@ jobs:
           finally { Pop-Location }
 
       - name: Verify Qt installation
+        id: verify-qt
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -213,6 +222,16 @@ jobs:
             Remove-Item -LiteralPath "$env:DEV_DIR\Qt\$env:QT_VERSION\build" -Recurse -Force
           }
           Get-ChildItem -LiteralPath $qtInstall | Select-Object -ExpandProperty Name
+
+      - name: Save the Qt installation to the cache
+        # Runs even when a later step fails, so a failed app build does not cost
+        # another full Qt build. Only a complete installation is stored.
+        if: always() && steps.qt-cache.outputs.cache-hit != 'true' && steps.verify-qt.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: C:/Dev/Qt/5.15.19/install
+          key: qt-win32-x64-5.15.19-static-v2
 
       - name: Build Mine-imator (Release, x64)
         # Same as ".\Setup.ps1 Release": configure with the Visual Studio generator,
